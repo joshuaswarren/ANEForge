@@ -31,6 +31,10 @@ demo logic itself stays in each file so every example is self-contained.
   reaction-diffusion system grows Turing patterns from the "ANEForge" wordmark, the whole
   update (a 3x3 Laplacian conv + reaction terms, periodic in-graph) compiled once and
   re-dispatched every step. Writes the animated `docs/assets/reaction_diffusion.webp`.
+- `game_of_life.py` - Conway's Game of Life with every generation as ONE on-engine forward
+  pass: the 8-neighbour count is a fixed 3x3 conv and the birth/survival rule is
+  elementwise, compiled once and re-dispatched every step. Writes the animated
+  `docs/assets/game_of_life.webp`.
 - `mandelbrot.py` - the Mandelbrot set by escape-time iteration: the complex orbit is carried
   as two real tensors and each iteration is ONE on-engine forward pass over the grid (frozen
   once it escapes), compiled once and re-dispatched. Writes `docs/assets/mandelbrot.png`.
