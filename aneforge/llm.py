@@ -241,6 +241,10 @@ PREFILL_MIXERS = {"attention": _attn_prefill}
 PREFILL_MLPS = {"swiglu": _swiglu, "geglu": _geglu, "gelu_new": _gelu_mlp}
 DECODE_MIXERS = {"attention": _attn_decode}
 DECODE_MLPS = {"swiglu": _swiglu, "geglu": _geglu, "gelu_new": _gelu_mlp}
+# Mixers too complex for one ANE program (whole-program compile ceiling, not a single
+# unsupported op): stage functions chained through the packed hidden tensor; the decoder
+# closes a program at each stage boundary. Each stage owns its own resident states.
+DECODE_MIXER_STAGES: dict[str, tuple] = {}
 # Per-position decode inputs a mixer may read from `ctx` (created per chunk, shared across its layers).
 _DECODE_CTX = ("oh", "inv", "mask", "cosp", "sinp")
 
@@ -441,6 +445,17 @@ class LlamaPrefill:
     from ._compile import compile_multi
     cfg = self.cfg; dh, D = cfg.dh, cfg.dim
     groups = self._layer_chunks(); chunks = []
+    def _flush(h, x, pairs, ctx, wpe_pos):
+      """Close the current program: compile, alias resident states, record ports."""
+      net = compile_multi([h] + [o for o, _ in pairs], compress=self.compress)
+      inm = {id(t): n for t, n in net.input_ports}; om = dict(net.output_ports)
+      for o, i in pairs:                                        # alias each state output -> its input (resident)
+        net.prog.share_buffer(0, om[o], 0, inm[id(i)])
+      p = {"x": inm[id(x)], "h": om[h], "states": {inm[id(i)]: i.shape for _, i in pairs}}
+      if wpe_pos is not None: p["wpe_pos"] = inm[id(wpe_pos)]
+      for k, t in ctx.items():
+        if id(t) in inm: p[k] = inm[id(t)]                      # only ports the chunk's mixers actually use
+      chunks.append({"net": net, "p": p})
     for gi, grp in enumerate(groups):
       x = _input((1, D))
       ctx = {"oh": _input((1, M, 1)), "inv": _input((1, M, 1)), "mask": _input((1, 1, M)),
@@ -452,21 +467,22 @@ class LlamaPrefill:
         h = h + wpe_pos @ _const(self.w["wpe"][:M].astype(np.float16))
       for li in grp:
         ls = self._spec(li); lw = self.w["layers"][li]
-        h, sp = DECODE_MIXERS[ls.mixer](h, lw, cfg, ls, ctx, M)
-        pairs += sp
+        stages = DECODE_MIXER_STAGES.get(ls.mixer)
+        if stages:
+          for si, fn in enumerate(stages):
+            h, sp = fn(h, lw, cfg, ls, ctx, M)
+            pairs += sp
+            if si < len(stages) - 1:                    # stage boundary: close this program; the packed
+              _flush(h, x, pairs, ctx, wpe_pos)         # boundary tensor becomes the next program's input
+              x = h; pairs = []; wpe_pos = None
+        else:
+          h, sp = DECODE_MIXERS[ls.mixer](h, lw, cfg, ls, ctx, M)
+          pairs += sp
         h = DECODE_MLPS[ls.mlp](h, lw, cfg, ls)
       if gi == len(groups) - 1:
         h = (h.layer_norm(self.w["final_norm_w"], self.w["final_norm_b"], cfg.norm_eps)
              if cfg.norm_type == "layer" else h.rms_norm(self.w["final_norm"], cfg.norm_eps))
-      net = compile_multi([h] + [o for o, _ in pairs], compress=self.compress)
-      inm = {id(t): n for t, n in net.input_ports}; om = dict(net.output_ports)
-      for o, i in pairs:                                        # alias each state output -> its input (resident)
-        net.prog.share_buffer(0, om[o], 0, inm[id(i)])
-      p = {"x": inm[id(x)], "h": om[h], "states": {inm[id(i)]: i.shape for _, i in pairs}}
-      if wpe_pos is not None: p["wpe_pos"] = inm[id(wpe_pos)]
-      for k, t in ctx.items():
-        if id(t) in inm: p[k] = inm[id(t)]                      # only ports the chunk's mixers actually use
-      chunks.append({"net": net, "p": p})
+      _flush(h, x, pairs, ctx, wpe_pos)
       if hasattr(self.w["layers"], "free"):                    # streamed weights: free this chunk's fp16 now it's baked
         for li in grp: self.w["layers"].free(li)
     cos_t, sin_t = (rope_tables(M, dh, cfg.rope_base, cfg.rotary_dim, cfg.rope_interleaved, cfg.rope_scaling)
