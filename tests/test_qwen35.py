@@ -115,11 +115,13 @@ def test_qwen35_hybrid_model_matches_transformers():
     mv = np.full((1, 1, M), -1e4, f16); mv[..., :pos + 1] = 0
     vals = {"oh": oh, "inv": iv, "mask": mv, "cosp": d["cos"][pos][None], "sinp": d["sin"][pos][None]}
     h = np.asarray(w["embed"][idl[pos]])[None].astype(f16)
+    hs = [h]
     for c in chunks:
-      p = c["p"]; pr = c["net"].prog; pr.set_input(p["x"], h)
+      p = c["p"]; pr = c["net"].prog
+      for port, buf in zip(p["x"], hs): pr.set_input(port, buf)
       for k in ("oh", "inv", "mask", "cosp", "sinp"):
         if k in p: pr.set_input(p[k], vals[k].astype(f16))
-      pr.execute(); h = np.asarray(pr.read_output(p["h"])).astype(f16)
-    outs[pos] = h.reshape(cfg.dim).astype(np.float32)
+      pr.execute(); hs = [np.asarray(pr.read_output(o), f16) for o in p["h"]]
+    outs[pos] = hs[0].reshape(cfg.dim).astype(np.float32)
   cos = float((outs.ravel() @ ref.ravel()) / (np.linalg.norm(outs) * np.linalg.norm(ref)))
   assert cos > 0.99, f"qwen3.5 hybrid model vs transformers: cosine {cos}"

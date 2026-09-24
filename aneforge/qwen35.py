@@ -51,11 +51,13 @@ def _gated_attn_decode(x, w, cfg, ls, ctx, M):
 
 def _deltanet_decode_stage_a(x, w, cfg, ls, ctx, M):
   """Gated-DeltaNet decode, host block: norms, projections, causal conv, gates, GQA
-  l2-normalization. Owns the resident conv state [conv_dim, K-1]. Emits the packed
-  vector tensor the state block consumes: [x, qn, kn, v, beta, gt, z]. Splitting this
-  mixer from the state block keeps each ANE program under the compiler's whole-program
-  complexity ceiling - the fused layer fails ANECCompile (err=11, mask=0x4) at real
-  Qwen dims while every isolated op and this 2-stage split compile cleanly."""
+  l2-normalization. Owns the resident conv state [conv_dim, K-1]. Emits the boundary as a
+  TUPLE of unpacked tensors (x, q, k, v, beta, gt, z) - each becomes a dedicated input port
+  of the next stage's program. The earlier packed-concat form forced the state block to
+  slice_by_size the packed hidden, and slice-fed operands into the batched matmuls blow the
+  compiler's whole-program ceiling (err=11, mask=0x4) while the same ops from dedicated
+  input ports compile (af-stageb-bisect). Splitting this mixer from the state block keeps
+  each ANE program under the ceiling at real Qwen dims."""
   e = cfg.extra
   nk, nv, dk, dv, K = e["nk"], e["nv"], e["dk"], e["dv"], e["conv_k"]
   kd, vd, CD, g3 = nk * dk, nv * dv, nk * dk * 2 + nv * dv, nv // nk
@@ -77,48 +79,38 @@ def _deltanet_decode_stage_a(x, w, cfg, ls, ctx, M):
   eye = np.eye(nk, dtype=np.float32)
   rep = _const(np.tile(eye, (g3, 1)) if e.get("gqa_repeat") == "tile" else np.repeat(eye, g3, 0))
   q = (rep @ q).l2_norm(-1, 1e-6) * (dk ** -0.5); k = (rep @ k).l2_norm(-1, 1e-6)
-  return (_concat([x, q.reshape((1, nv * dk)), k.reshape((1, nv * dk)), v.reshape((1, nv * dv)),
-                   beta.reshape((1, nv)), gt.reshape((1, nv)), z.reshape((1, nv * dv))], axis=1),
-          [(cs_out, cs)])
+  return (x, q, k, v, beta, gt, z), [(cs_out, cs)]
 
 
 def _deltanet_decode_stage_b(h, w, cfg, ls, ctx, M):
-  """Gated-DeltaNet decode, state block: unpacks stage A's packed hidden and applies the
-  DeltaNet recurrence to the resident state [nv, dk, dv] (decay, k@S delta rule, outer
-  update). Emits the packed [x, o, z] the readout block consumes; the q readout, its
-  normalization and the out_proj tail are a third program because the state block plus
-  readout together still cross the compiler's whole-program ceiling at real dims."""
+  """Gated-DeltaNet decode, state block: consumes stage A's unpacked boundary as dedicated
+  input ports (no slice views of a packed hidden) and applies the DeltaNet recurrence to
+  the resident state [nv, dk, dv] (decay, k@S delta rule, outer update). Emits the unpacked
+  (x, o, z) tuple the readout block consumes as ports; the q readout, its normalization and
+  the out_proj tail are a third program because the state block plus readout together still
+  cross the compiler's whole-program ceiling at real dims."""
+  x, q, k, v, beta, gt, z = h
   e = cfg.extra
   nk, nv, dk, dv, K = e["nk"], e["nv"], e["dk"], e["dv"], e["conv_k"]
-  kd, vd = nk * dk, nv * dv
-  D = cfg.dim
   S = _input((nv, dk, dv))
-  x = h.slice_by_size([0, 0], [1, D])
-  q = h.slice_by_size([0, D], [1, nv * dk]).reshape((nv, 1, dk))
-  off = D + nv * dk
-  k = h.slice_by_size([0, off], [1, nv * dk]).reshape((nv, 1, dk)); off += nv * dk
-  v = h.slice_by_size([0, off], [1, nv * dv]).reshape((nv, 1, dv)); off += nv * dv
-  beta = h.slice_by_size([0, off], [1, nv]).reshape((nv, 1, 1)); off += nv
-  gt = h.slice_by_size([0, off], [1, nv]).reshape((nv, 1, 1)); off += nv
-  z = h.slice_by_size([0, off], [1, nv * dv]).reshape((nv, dv))
+  q = q.reshape((nv, 1, dk)); k = k.reshape((nv, 1, dk)); v = v.reshape((nv, 1, dv))
   S1 = S * gt                                                    # decay first (transformers/qwen3.5)
   kv = k @ S1; delta = (v - kv) * beta
   Sout = S1 + (k.transpose([0, 2, 1]) @ delta)
   o = (q @ Sout).reshape((nv, dv))
-  return _concat([x, o.reshape((1, nv * dv)), z.reshape((1, nv * dv))], axis=1), [(Sout, S)]
+  return (x, o, z), [(Sout, S)]
 
 
 def _deltanet_decode_stage_c(h, w, cfg, ls, ctx, M):
-  """Gated-DeltaNet decode, readout tail: RMSNormGated + SwiGLU gate + out_proj + residual."""
+  """Gated-DeltaNet decode, readout tail: consumes the unpacked (x, o, z) ports; RMSNormGated
+  + SwiGLU gate + out_proj + residual. Returns the single new residual stream."""
+  x, o, z = h
   e = cfg.extra
   nk, nv, dk, dv, K = e["nk"], e["nv"], e["dk"], e["dv"], e["conv_k"]
   vd = nv * dv
-  D = cfg.dim
-  x = h.slice_by_size([0, 0], [1, D])
-  o = h.slice_by_size([0, D], [1, vd]).reshape((nv, dv))
-  z = h.slice_by_size([0, D + vd], [1, vd]).reshape((nv, dv))
-  o = o.rms_norm(w["ssm_norm"], cfg.norm_eps) * z.silu()         # RMSNormGated, then SwiGLU gate
-  return x + o.reshape((1, vd)).linear(w["out_proj"]), []
+  o = o.reshape((1, vd))
+  o = o.rms_norm(w["ssm_norm"], cfg.norm_eps) * z.silu().reshape((1, vd))  # RMSNormGated, then SwiGLU gate
+  return x + o.linear(w["out_proj"]), []
 
 
 def _deltanet_decode(x, w, cfg, ls, ctx, M):
@@ -126,9 +118,9 @@ def _deltanet_decode(x, w, cfg, ls, ctx, M):
   conv state [conv_dim, K-1] and recurrent state [nv, dk, dv]. The decoder compiles the three
   stages as separate ANE programs (DECODE_MIXER_STAGES); this fused form exists for direct
   consumers and small-dim validation."""
-  h, pairs_a = _deltanet_decode_stage_a(x, w, cfg, ls, ctx, M)
-  h, pairs_b = _deltanet_decode_stage_b(h, w, cfg, ls, ctx, M)
-  h, pairs_c = _deltanet_decode_stage_c(h, w, cfg, ls, ctx, M)
+  hb, pairs_a = _deltanet_decode_stage_a(x, w, cfg, ls, ctx, M)
+  hb, pairs_b = _deltanet_decode_stage_b(hb, w, cfg, ls, ctx, M)
+  h, pairs_c = _deltanet_decode_stage_c(hb, w, cfg, ls, ctx, M)
   return h, pairs_a + pairs_b + pairs_c
 
 

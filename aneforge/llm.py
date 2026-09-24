@@ -445,13 +445,21 @@ class LlamaPrefill:
     from ._compile import compile_multi
     cfg = self.cfg; dh, D = cfg.dh, cfg.dim
     groups = self._layer_chunks(); chunks = []
-    def _flush(h, x, pairs, ctx, wpe_pos):
-      """Close the current program: compile, alias resident states, record ports."""
-      net = compile_multi([h] + [o for o, _ in pairs], compress=self.compress)
+    def _flush(h, pairs, ctx, wpe_pos):
+      """Close the current program: compile, alias resident states, record ports.
+      `h` may be a single boundary tensor or a TUPLE of unpacked boundary tensors
+      (staged mixers chain per-stage ports; every tuple element becomes an output
+      port, and the elements without an in-program producer - all of them for a
+      mid-layer stage boundary, the chunk input excepted for the first - are the
+      input ports the runner feeds)."""
+      outs = list(h) if isinstance(h, tuple) else [h]
+      net = compile_multi(outs + [o for o, _ in pairs], compress=self.compress)
       inm = {id(t): n for t, n in net.input_ports}; om = dict(net.output_ports)
       for o, i in pairs:                                        # alias each state output -> its input (resident)
         net.prog.share_buffer(0, om[o], 0, inm[id(i)])
-      p = {"x": inm[id(x)], "h": om[h], "states": {inm[id(i)]: i.shape for _, i in pairs}}
+      p = {"x": [inm[id(t)] for t in outs if id(t) in inm],    # ports the host must feed
+           "h": [om[t] for t in outs],                          # ports the host reads back (tuple order)
+           "states": {inm[id(i)]: i.shape for _, i in pairs}}
       if wpe_pos is not None: p["wpe_pos"] = inm[id(wpe_pos)]
       for k, t in ctx.items():
         if id(t) in inm: p[k] = inm[id(t)]                      # only ports the chunk's mixers actually use
@@ -472,9 +480,9 @@ class LlamaPrefill:
           for si, fn in enumerate(stages):
             h, sp = fn(h, lw, cfg, ls, ctx, M)
             pairs += sp
-            if si < len(stages) - 1:                    # stage boundary: close this program; the packed
-              _flush(h, x, pairs, ctx, wpe_pos)         # boundary tensor becomes the next program's input
-              x = h; pairs = []; wpe_pos = None
+            if si < len(stages) - 1:                    # stage boundary: close this program; the unpacked
+              _flush(h, pairs, ctx, wpe_pos)            # boundary tensors become the next program's ports
+              pairs = []; wpe_pos = None
         else:
           h, sp = DECODE_MIXERS[ls.mixer](h, lw, cfg, ls, ctx, M)
           pairs += sp
@@ -482,7 +490,7 @@ class LlamaPrefill:
       if gi == len(groups) - 1:
         h = (h.layer_norm(self.w["final_norm_w"], self.w["final_norm_b"], cfg.norm_eps)
              if cfg.norm_type == "layer" else h.rms_norm(self.w["final_norm"], cfg.norm_eps))
-      _flush(h, x, pairs, ctx, wpe_pos)
+      _flush(h, pairs, ctx, wpe_pos)
       if hasattr(self.w["layers"], "free"):                    # streamed weights: free this chunk's fp16 now it's baked
         for li in grp: self.w["layers"].free(li)
     cos_t, sin_t = (rope_tables(M, dh, cfg.rope_base, cfg.rotary_dim, cfg.rope_interleaved, cfg.rope_scaling)
@@ -603,20 +611,20 @@ class LlamaPrefill:
         vals["cosp"] = d["cos"][pos][None]; vals["sinp"] = d["sin"][pos][None]
       t0 = time.perf_counter() if profiling else 0.0
       emb = self.w["embed"][tok]
-      h = np.asarray(emb)[None].astype(f16)
+      hs = [np.asarray(emb)[None].astype(f16)]
       wpe_pos = np.zeros((1, M), f16) if "wpe" in self.w else None
       if wpe_pos is not None: wpe_pos[0, pos] = 1.0
       if on_stage is not None: on_stage("embedding", time.perf_counter() - t0)
       t0 = time.perf_counter() if profiling else 0.0
-      for c in chunks:                                         # hidden flows chunk -> chunk (cheap [1,dim] round-trip)
+      for c in chunks:                                         # boundary tensors flow chunk -> chunk (host round-trip)
         p = c["p"]; pr = c["net"].prog
-        pr.set_input(p["x"], h)
+        for port, buf in zip(p["x"], hs): pr.set_input(port, buf)
         for k in _DECODE_CTX:
           if k in p: pr.set_input(p[k], vals[k])
         if "wpe_pos" in p: pr.set_input(p["wpe_pos"], wpe_pos)
-        pr.execute(); h = np.asarray(pr.read_output(p["h"])).astype(f16)
+        pr.execute(); hs = [np.asarray(pr.read_output(o), f16) for o in p["h"]]
       if on_stage is not None: on_stage("layers", time.perf_counter() - t0)
-      return h.reshape(cfg.dim).astype(np.float32)
+      return hs[0].reshape(cfg.dim).astype(np.float32)
     use_batched = (batched_prefill and len(prompt) > 1
                    and not hasattr(self.w["layers"], "free")     # streamed weights are freed by _decoder; can't re-bake
                    and all(self._spec(i).mixer == "attention" for i in range(cfg.n_layers)))
