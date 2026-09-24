@@ -110,9 +110,8 @@ def _deltanet_decode_stage_c(hmap, w, cfg, ls, ctx, M):
   e = cfg.extra
   nk, nv, dk, dv, K = e["nk"], e["nv"], e["dk"], e["dv"], e["conv_k"]
   vd = nv * dv
-  o = o.reshape((1, vd))
-  o = o.rms_norm(w["ssm_norm"], cfg.norm_eps) * z.silu().reshape((1, vd))  # RMSNormGated, then SwiGLU gate
-  return {"h": x + o.linear(w["out_proj"])}, []
+  o = o.rms_norm(w["ssm_norm"], cfg.norm_eps) * z.silu()         # RMSNormGated, then SwiGLU gate
+  return {"h": x + o.reshape((1, vd)).linear(w["out_proj"])}, []
 
 
 def _deltanet_decode(x, w, cfg, ls, ctx, M):
