@@ -114,14 +114,14 @@ def test_qwen35_hybrid_model_matches_transformers():
     oh = np.zeros((1, M, 1), f16); oh[0, pos, 0] = 1; iv = np.ones((1, M, 1), f16); iv[0, pos, 0] = 0
     mv = np.full((1, 1, M), -1e4, f16); mv[..., :pos + 1] = 0
     vals = {"oh": oh, "inv": iv, "mask": mv, "cosp": d["cos"][pos][None], "sinp": d["sin"][pos][None]}
-    h = np.asarray(w["embed"][idl[pos]])[None].astype(f16)
-    hs = [h]
+    hs = {d["emb_lane"]: np.asarray(w["embed"][idl[pos]])[None].astype(f16)}
     for c in chunks:
       p = c["p"]; pr = c["net"].prog
-      for port, buf in zip(p["x"], hs): pr.set_input(port, buf)
+      for lane, port in p["x"].items(): pr.set_input(port, hs[lane])
       for k in ("oh", "inv", "mask", "cosp", "sinp"):
         if k in p: pr.set_input(p[k], vals[k].astype(f16))
-      pr.execute(); hs = [np.asarray(pr.read_output(o), f16) for o in p["h"]]
-    outs[pos] = hs[0].reshape(cfg.dim).astype(np.float32)
+      pr.execute()
+      for lane, port in p["h"].items(): hs[lane] = np.asarray(pr.read_output(port), f16)
+    outs[pos] = hs[d["out_lane"]].reshape(cfg.dim).astype(np.float32)
   cos = float((outs.ravel() @ ref.ravel()) / (np.linalg.norm(outs) * np.linalg.norm(ref)))
   assert cos > 0.99, f"qwen3.5 hybrid model vs transformers: cosine {cos}"
