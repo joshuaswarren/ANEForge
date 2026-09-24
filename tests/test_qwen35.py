@@ -114,14 +114,16 @@ def test_qwen35_hybrid_model_matches_transformers():
     oh = np.zeros((1, M, 1), f16); oh[0, pos, 0] = 1; iv = np.ones((1, M, 1), f16); iv[0, pos, 0] = 0
     mv = np.full((1, 1, M), -1e4, f16); mv[..., :pos + 1] = 0
     vals = {"oh": oh, "inv": iv, "mask": mv, "cosp": d["cos"][pos][None], "sinp": d["sin"][pos][None]}
-    hs = {d["emb_lane"]: np.asarray(w["embed"][idl[pos]])[None].astype(f16)}
+    hs: dict = {}; hidden = np.asarray(w["embed"][idl[pos]])[None].astype(f16)
     for c in chunks:
+      if c["p"].get("group_start"): hs["x"] = hidden
       p = c["p"]; pr = c["net"].prog
       for lane, port in p["x"].items(): pr.set_input(port, hs[lane])
       for k in ("oh", "inv", "mask", "cosp", "sinp"):
         if k in p: pr.set_input(p[k], vals[k].astype(f16))
       pr.execute()
       for lane, port in p["h"].items(): hs[lane] = np.asarray(pr.read_output(port), f16)
-    outs[pos] = hs[d["out_lane"]].reshape(cfg.dim).astype(np.float32)
+      if c["p"].get("group_end"): hidden = hs["h"]
+    outs[pos] = hidden.reshape(cfg.dim).astype(np.float32)
   cos = float((outs.ravel() @ ref.ravel()) / (np.linalg.norm(outs) * np.linalg.norm(ref)))
   assert cos > 0.99, f"qwen3.5 hybrid model vs transformers: cosine {cos}"
