@@ -472,6 +472,7 @@ class LlamaPrefill:
       ctx = {"oh": _input((1, M, 1)), "inv": _input((1, M, 1)), "mask": _input((1, 1, M)),
              "cosp": _input((1, dh)), "sinp": _input((1, dh))}
       hmap = {"x": _input((1, D))}
+      seg_in = hmap                              # lanes this PROGRAM consumed (fed by the host)
       pairs = []
       wpe_pos = None
       if gi == 0 and "wpe" in self.w:
@@ -486,20 +487,21 @@ class LlamaPrefill:
             hb, sp = fn(hmap, lw, cfg, ls, ctx, M)
             pairs += sp
             if si < len(stages) - 1:                    # stage boundary: close this program; every boundary
-              _flush(hmap, hb, pairs, ctx, wpe_pos, group_start, False)   # tensor is re-rooted to a fresh input
-              hmap = {k: _input(t.shape) for k, t in hb.items()}          # for the next stage's program
+              _flush(seg_in, hb, pairs, ctx, wpe_pos, group_start, False)  # tensor is re-rooted to a fresh
+              hmap = {k: _input(t.shape) for k, t in hb.items()}            # input for the next stage's program
+              seg_in = hmap
               pairs = []; wpe_pos = None; group_start = False
           h = DECODE_MLPS[ls.mlp](hb["h"], lw, cfg, ls)
         else:
           ht, sp = DECODE_MIXERS[ls.mixer](hmap["x"], lw, cfg, ls, ctx, M)
           pairs += sp
           h = DECODE_MLPS[ls.mlp](ht, lw, cfg, ls)
-        hmap = {"x": h}
+        hmap = {"x": h}                          # next segment's input; seg_in stays until its own flush
       if gi == len(groups) - 1:
         h = (h.layer_norm(self.w["final_norm_w"], self.w["final_norm_b"], cfg.norm_eps)
              if cfg.norm_type == "layer" else h.rms_norm(self.w["final_norm"], cfg.norm_eps))
       hmap_out = {"h": h}
-      _flush(hmap, hmap_out, pairs, ctx, wpe_pos, group_start, True)
+      _flush(seg_in, hmap_out, pairs, ctx, wpe_pos, group_start, True)
       if hasattr(self.w["layers"], "free"):                    # streamed weights: free this chunk's fp16 now it's baked
         for li in grp: self.w["layers"].free(li)
     cos_t, sin_t = (rope_tables(M, dh, cfg.rope_base, cfg.rotary_dim, cfg.rope_interleaved, cfg.rope_scaling)
