@@ -241,6 +241,10 @@ PREFILL_MIXERS = {"attention": _attn_prefill}
 PREFILL_MLPS = {"swiglu": _swiglu, "geglu": _geglu, "gelu_new": _gelu_mlp}
 DECODE_MIXERS = {"attention": _attn_decode}
 DECODE_MLPS = {"swiglu": _swiglu, "geglu": _geglu, "gelu_new": _gelu_mlp}
+# Mixers too complex for one ANE program (whole-program compile ceiling, not a single
+# unsupported op): stage functions chained through the packed hidden tensor; the decoder
+# closes a program at each stage boundary. Each stage owns its own resident states.
+DECODE_MIXER_STAGES: dict[str, tuple] = {}
 # Per-position decode inputs a mixer may read from `ctx` (created per chunk, shared across its layers).
 _DECODE_CTX = ("oh", "inv", "mask", "cosp", "sinp")
 
@@ -444,32 +448,63 @@ class LlamaPrefill:
     from ._compile import compile_multi
     cfg = self.cfg; dh, D = cfg.dh, cfg.dim
     groups = self._layer_chunks(); chunks = []
-    for gi, grp in enumerate(groups):
-      x = _input((1, D))
-      ctx = {"oh": _input((1, M, 1)), "inv": _input((1, M, 1)), "mask": _input((1, 1, M)),
-             "cosp": _input((1, dh)), "sinp": _input((1, dh))}
-      h = x; pairs = []
-      wpe_pos = None
-      if gi == 0 and "wpe" in self.w:
-        wpe_pos = _input((1, M))
-        h = h + wpe_pos @ _const(self.w["wpe"][:M].astype(np.float16))
-      for li in grp:
-        ls = self._spec(li); lw = self.w["layers"][li]
-        h, sp = DECODE_MIXERS[ls.mixer](h, lw, cfg, ls, ctx, M)
-        pairs += sp
-        h = DECODE_MLPS[ls.mlp](h, lw, cfg, ls)
-      if gi == len(groups) - 1:
-        h = (h.layer_norm(self.w["final_norm_w"], self.w["final_norm_b"], cfg.norm_eps)
-             if cfg.norm_type == "layer" else h.rms_norm(self.w["final_norm"], cfg.norm_eps))
-      net = compile_multi([h] + [o for o, _ in pairs], compress=self.compress)
+    def _flush(hmap_in, produced, pairs, ctx, wpe_pos, group_start, group_end):
+      """Close the current program: compile, alias resident states, record ports.
+      Cross-program data flows through NAMED LANES: the segment consumed fresh
+      `_input` placeholders (hmap_in - tensors the previous program emitted) and
+      produced new tensors (produced). Tensors carried unchanged through a segment
+      are re-rooted by the caller and never enter this graph, so the compiler never
+      sees an identity input->output port (the e5rt bridge rejects those) and never
+      walks past a boundary into the previous segment's ops (the original err=11
+      ceiling breaker: _topo_multi follows srcs unconditionally)."""
+      fresh = {k: t for k, t in produced.items() if hmap_in.get(k) is not t}   # carried lanes are NOT outputs
+      net = compile_multi(list(fresh.values()) + [o for o, _ in pairs], compress=self.compress)
       inm = {id(t): n for t, n in net.input_ports}; om = dict(net.output_ports)
       for o, i in pairs:                                        # alias each state output -> its input (resident)
         net.prog.share_buffer(0, om[o], 0, inm[id(i)])
-      p = {"x": inm[id(x)], "h": om[h], "states": {inm[id(i)]: i.shape for _, i in pairs}}
+      p = {"x": {name: inm[id(t)] for name, t in hmap_in.items() if id(t) in inm},
+           "h": {name: om[t] for name, t in fresh.items()},
+           "states": {inm[id(i)]: i.shape for _, i in pairs}}
+      if group_start: p["group_start"] = True
+      if group_end: p["group_end"] = True
       if wpe_pos is not None: p["wpe_pos"] = inm[id(wpe_pos)]
       for k, t in ctx.items():
         if id(t) in inm: p[k] = inm[id(t)]                      # only ports the chunk's mixers actually use
       chunks.append({"net": net, "p": p})
+    for gi, grp in enumerate(groups):
+      ctx = {"oh": _input((1, M, 1)), "inv": _input((1, M, 1)), "mask": _input((1, 1, M)),
+             "cosp": _input((1, dh)), "sinp": _input((1, dh))}
+      hmap = {"x": _input((1, D))}
+      seg_in = hmap                              # lanes this PROGRAM consumed (fed by the host)
+      pairs = []
+      wpe_pos = None
+      if gi == 0 and "wpe" in self.w:
+        wpe_pos = _input((1, M))
+        hmap["x"] = hmap["x"] + wpe_pos @ _const(self.w["wpe"][:M].astype(np.float16))
+      group_start = True
+      for li in grp:
+        ls = self._spec(li); lw = self.w["layers"][li]
+        stages = DECODE_MIXER_STAGES.get(ls.mixer)
+        if stages:
+          for si, fn in enumerate(stages):
+            hb, sp = fn(hmap, lw, cfg, ls, ctx, M)
+            pairs += sp
+            if si < len(stages) - 1:                    # stage boundary: close this program; every boundary
+              _flush(seg_in, hb, pairs, ctx, wpe_pos, group_start, False)  # tensor is re-rooted to a fresh
+              hmap = {k: _input(t.shape) for k, t in hb.items()}            # input for the next stage's program
+              seg_in = hmap
+              pairs = []; wpe_pos = None; group_start = False
+          h = DECODE_MLPS[ls.mlp](hb["h"], lw, cfg, ls)
+        else:
+          ht, sp = DECODE_MIXERS[ls.mixer](hmap["x"], lw, cfg, ls, ctx, M)
+          pairs += sp
+          h = DECODE_MLPS[ls.mlp](ht, lw, cfg, ls)
+        hmap = {"x": h}                          # next segment's input; seg_in stays until its own flush
+      if gi == len(groups) - 1:
+        h = (h.layer_norm(self.w["final_norm_w"], self.w["final_norm_b"], cfg.norm_eps)
+             if cfg.norm_type == "layer" else h.rms_norm(self.w["final_norm"], cfg.norm_eps))
+      hmap_out = {"h": h}
+      _flush(seg_in, hmap_out, pairs, ctx, wpe_pos, group_start, True)
       if hasattr(self.w["layers"], "free"):                    # streamed weights: free this chunk's fp16 now it's baked
         for li in grp: self.w["layers"].free(li)
     cos_t, sin_t = (rope_tables(M, dh, cfg.rope_base, cfg.rotary_dim, cfg.rope_interleaved, cfg.rope_scaling)
@@ -589,21 +624,24 @@ class LlamaPrefill:
       if d["cos"] is not None:
         vals["cosp"] = d["cos"][pos][None]; vals["sinp"] = d["sin"][pos][None]
       t0 = time.perf_counter() if profiling else 0.0
-      emb = self.w["embed"][tok]
-      h = np.asarray(emb)[None].astype(f16)
+      emb = np.asarray(self.w["embed"][tok])[None].astype(f16)
+      hs: dict = {}; hidden = emb                               # "x" lane of the first group is the embedding
       wpe_pos = np.zeros((1, M), f16) if "wpe" in self.w else None
       if wpe_pos is not None: wpe_pos[0, pos] = 1.0
       if on_stage is not None: on_stage("embedding", time.perf_counter() - t0)
       t0 = time.perf_counter() if profiling else 0.0
-      for c in chunks:                                         # hidden flows chunk -> chunk (cheap [1,dim] round-trip)
+      for c in chunks:                                         # boundary lanes flow chunk -> chunk (host round-trip)
         p = c["p"]; pr = c["net"].prog
-        pr.set_input(p["x"], h)
+        if p.get("group_start"): hs["x"] = hidden
+        for lane, port in p["x"].items(): pr.set_input(port, hs[lane])
         for k in _DECODE_CTX:
           if k in p: pr.set_input(p[k], vals[k])
         if "wpe_pos" in p: pr.set_input(p["wpe_pos"], wpe_pos)
-        pr.execute(); h = np.asarray(pr.read_output(p["h"])).astype(f16)
+        pr.execute()
+        for lane, port in p["h"].items(): hs[lane] = np.asarray(pr.read_output(port), f16)
+        if p.get("group_end"): hidden = hs["h"]
       if on_stage is not None: on_stage("layers", time.perf_counter() - t0)
-      return h.reshape(cfg.dim).astype(np.float32)
+      return hidden.reshape(cfg.dim).astype(np.float32)
     use_batched = (batched_prefill and len(prompt) > 1
                    and not hasattr(self.w["layers"], "free")     # streamed weights are freed by _decoder; can't re-bake
                    and all(self._spec(i).mixer == "attention" for i in range(cfg.n_layers)))

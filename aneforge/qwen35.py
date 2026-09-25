@@ -49,14 +49,18 @@ def _gated_attn_decode(x, w, cfg, ls, ctx, M):
   return x + a.linear(w["wo"]), [(Kout, Kin), (Vout, Vin)]
 
 
-def _deltanet_decode(x, w, cfg, ls, ctx, M):
-  """Single-token Gated-DeltaNet decode. Owns a resident conv state [conv_dim, K-1] and recurrent state
-  [nv, dk, dv]; ignores the per-position `ctx` (it carries its own state). Returns (hidden+residual,
-  [(conv_out,conv_in), (rec_out,rec_in)]) for the runner to alias resident via `share_buffer`."""
+def _deltanet_decode_stage_a(hmap, w, cfg, ls, ctx, M):
+  """Gated-DeltaNet decode, host block: norms, projections, causal conv, gates, GQA
+  l2-normalization. Owns the resident conv state [conv_dim, K-1]. Boundary lanes in:
+  {"x": residual}; lanes out: {"x": carried residual, "q","k","v","beta","gt","z"}.
+  Splitting this mixer from the state block keeps each ANE program under the compiler's
+  whole-program complexity ceiling - the fused layer fails ANECCompile (err=11, mask=0x4)
+  at real Qwen dims while every isolated op compiles."""
   e = cfg.extra
   nk, nv, dk, dv, K = e["nk"], e["nv"], e["dk"], e["dv"], e["conv_k"]
   kd, vd, CD, g3 = nk * dk, nv * dv, nk * dk * 2 + nv * dv, nv // nk
-  cs = _input((CD, K - 1)); S = _input((nv, dk, dv))
+  cs = _input((CD, K - 1))
+  x = hmap["x"]
   xn = x.rms_norm(w["in_norm"], cfg.norm_eps)
   qkv = xn.linear(w["in_proj_qkv"]).reshape((CD, 1))
   z = xn.linear(w["in_proj_z"]).reshape((nv, dv))
@@ -74,17 +78,57 @@ def _deltanet_decode(x, w, cfg, ls, ctx, M):
   eye = np.eye(nk, dtype=np.float32)
   rep = _const(np.tile(eye, (g3, 1)) if e.get("gqa_repeat") == "tile" else np.repeat(eye, g3, 0))
   q = (rep @ q).l2_norm(-1, 1e-6) * (dk ** -0.5); k = (rep @ k).l2_norm(-1, 1e-6)
-  q = q.reshape((nv, 1, dk)); k = k.reshape((nv, 1, dk)); v = v.reshape((nv, 1, dv))
+  return {"x": x, "q": q, "k": k, "v": v, "beta": beta, "gt": gt, "z": z}, [(cs_out, cs)]
+
+
+def _deltanet_decode_stage_b(hmap, w, cfg, ls, ctx, M):
+  """Gated-DeltaNet decode, state block: applies the DeltaNet recurrence to the resident
+  state [nv, dk, dv] (decay, k@S delta rule, outer update). Boundary lanes in:
+  {"q","k","v","beta","gt"} consumed (fresh inputs of this program), {"x","z"} carried
+  untouched for the readout. Lanes out: {"x","o","z"} - o produced here, x/z carried.
+  Carried lanes are re-rooted by the decoder and never enter this graph, so no
+  slice-view of a packed hidden ever feeds the batched matmuls (the 804234f
+  KNOWN-REMAINING: slice-fed operands blew the whole-program ceiling)."""
+  e = cfg.extra
+  nk, nv, dk, dv, K = e["nk"], e["nv"], e["dk"], e["dv"], e["conv_k"]
+  S = _input((nv, dk, dv))
+  q = hmap["q"].reshape((nv, 1, dk)); k = hmap["k"].reshape((nv, 1, dk))
+  v = hmap["v"].reshape((nv, 1, dv))
+  beta, gt, x, z = hmap["beta"], hmap["gt"], hmap["x"], hmap["z"]
   S1 = S * gt                                                    # decay first (transformers/qwen3.5)
   kv = k @ S1; delta = (v - kv) * beta
   Sout = S1 + (k.transpose([0, 2, 1]) @ delta)
   o = (q @ Sout).reshape((nv, dv))
+  return {"x": x, "o": o, "z": z}, [(Sout, S)]
+
+
+def _deltanet_decode_stage_c(hmap, w, cfg, ls, ctx, M):
+  """Gated-DeltaNet decode, readout tail: RMSNormGated + SwiGLU gate + out_proj + residual.
+  Boundary lanes in: {"x","o","z"} (fresh inputs of this program). Lane out: {"h"} - the
+  single new residual stream."""
+  x, o, z = hmap["x"], hmap["o"], hmap["z"]
+  e = cfg.extra
+  nk, nv, dk, dv, K = e["nk"], e["nv"], e["dk"], e["dv"], e["conv_k"]
+  vd = nv * dv
   o = o.rms_norm(w["ssm_norm"], cfg.norm_eps) * z.silu()         # RMSNormGated, then SwiGLU gate
-  return x + o.reshape((1, vd)).linear(w["out_proj"]), [(cs_out, cs), (Sout, S)]
+  return {"h": x + o.reshape((1, vd)).linear(w["out_proj"])}, []
+
+
+def _deltanet_decode(x, w, cfg, ls, ctx, M):
+  """Single-token Gated-DeltaNet decode as one graph (all three stages fused). Owns a resident
+  conv state [conv_dim, K-1] and recurrent state [nv, dk, dv]. The decoder compiles the three
+  stages as separate ANE programs (DECODE_MIXER_STAGES); this fused form exists for direct
+  consumers and small-dim validation."""
+  hb, pairs_a = _deltanet_decode_stage_a({"x": x}, w, cfg, ls, ctx, M)
+  hb, pairs_b = _deltanet_decode_stage_b(hb, w, cfg, ls, ctx, M)
+  hc, pairs_c = _deltanet_decode_stage_c(hb, w, cfg, ls, ctx, M)
+  return hc["h"], pairs_a + pairs_b + pairs_c
 
 
 llm.DECODE_MIXERS["gated_deltanet"] = _deltanet_decode
 llm.DECODE_MIXERS["gated_attention"] = _gated_attn_decode
+llm.DECODE_MIXER_STAGES["gated_deltanet"] = (_deltanet_decode_stage_a, _deltanet_decode_stage_b,
+                                             _deltanet_decode_stage_c)
 
 
 def adapt(c, sd, prefix: str = ""):
@@ -136,7 +180,8 @@ def load_gguf(path: str, n_layers: int | None = None, compress: str | None = Non
   from .moe import _LazyLayers
   v = GGUFView(path); sc, get, tn = v.sc, v.get, v.tn
 
-  n_total = int(sc("block_count", 0)); n = n_total if n_layers is None else min(n_layers, n_total)
+  n_total = int(sc("block_count", 0)) - int(sc("nextn_predict_layers", 0) or 0)  # trailing MTP (nextn) blocks are not main decoder layers
+  n = n_total if n_layers is None else min(n_layers, n_total)
   dim, heads = int(sc("embedding_length", 0)), int(sc("attention.head_count", 0))
   interval = int(sc("full_attention_interval", 4)); is_attn = lambda L: (L + 1) % interval == 0
   nk, dk, conv_k = int(sc("ssm.group_count", 0)), int(sc("ssm.state_size", 0)), int(sc("ssm.conv_kernel", 0))
@@ -172,5 +217,5 @@ def load_gguf(path: str, n_layers: int | None = None, compress: str | None = Non
   # embed: host gather, fp16 (saves ~2.5GB at vocab ~248k; cast to fp16 anyway) and *S to match the residual.
   # lm_head: fp32 (numpy has no fp16 BLAS, so an fp16 host matmul at this vocab is slow).
   w = {"embed": (get("token_embd.weight", np.float16) * S), "final_norm": get("output_norm.weight"),
-       "lm_head": get("output.weight", np.float32), "layers": _LazyLayers(layer, n)}
+       "lm_head": get("output.weight", np.float32) if v.has("output.weight") else get("token_embd.weight", np.float32), "layers": _LazyLayers(layer, n)}
   return llm.LlamaPrefill(cfg, w, compress=compress)
