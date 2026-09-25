@@ -180,7 +180,8 @@ def load_gguf(path: str, n_layers: int | None = None, compress: str | None = Non
   from .moe import _LazyLayers
   v = GGUFView(path); sc, get, tn = v.sc, v.get, v.tn
 
-  n_total = int(sc("block_count", 0)); n = n_total if n_layers is None else min(n_layers, n_total)
+  n_total = int(sc("block_count", 0)) - int(sc("nextn_predict_layers", 0) or 0)  # trailing MTP (nextn) blocks are not main decoder layers
+  n = n_total if n_layers is None else min(n_layers, n_total)
   dim, heads = int(sc("embedding_length", 0)), int(sc("attention.head_count", 0))
   interval = int(sc("full_attention_interval", 4)); is_attn = lambda L: (L + 1) % interval == 0
   nk, dk, conv_k = int(sc("ssm.group_count", 0)), int(sc("ssm.state_size", 0)), int(sc("ssm.conv_kernel", 0))
@@ -216,5 +217,5 @@ def load_gguf(path: str, n_layers: int | None = None, compress: str | None = Non
   # embed: host gather, fp16 (saves ~2.5GB at vocab ~248k; cast to fp16 anyway) and *S to match the residual.
   # lm_head: fp32 (numpy has no fp16 BLAS, so an fp16 host matmul at this vocab is slow).
   w = {"embed": (get("token_embd.weight", np.float16) * S), "final_norm": get("output_norm.weight"),
-       "lm_head": get("output.weight", np.float32), "layers": _LazyLayers(layer, n)}
+       "lm_head": get("output.weight", np.float32) if v.has("output.weight") else get("token_embd.weight", np.float32), "layers": _LazyLayers(layer, n)}
   return llm.LlamaPrefill(cfg, w, compress=compress)

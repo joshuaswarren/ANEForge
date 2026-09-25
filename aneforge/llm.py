@@ -509,12 +509,6 @@ class LlamaPrefill:
     self._dec = {"M": M, "chunks": chunks, "cos": cos_t, "sin": sin_t}
     return self._dec
 
-    cos_t, sin_t = (rope_tables(M, dh, cfg.rope_base, cfg.rotary_dim, cfg.rope_interleaved, cfg.rope_scaling)
-                    if cfg.rope else (None, None))
-    self._dec = {"M": M, "chunks": chunks, "cos": cos_t, "sin": sin_t,
-                 "emb_lane": emb_lane, "out_lane": out_lane}
-    return self._dec
-
   def warmup(self, max_len):
     """Compile and cache the decode program for context length `max_len` (the one-time cost) so the next
     `generate` streams immediately. If `ane_lm_head` is active, compile the ANE lm_head too, so the first
