@@ -81,6 +81,17 @@ def _deltanet_decode_stage_a(hmap, w, cfg, ls, ctx, M):
   return {"x": x, "q": q, "k": k, "v": v, "beta": beta, "gt": gt, "z": z}, [(cs_out, cs)]
 
 
+_BMM_SCALE = 256.0   # 2^8
+
+
+def _scaled_bmm(a, b):
+  """`a @ b` with the left operand scaled by 2^8 before the matmul and the result by 2^-8 after. The ANE matmul has an
+  absolute error floor in its raw output that is large next to the tiny products of the delta-rule state update
+  (unit-norm k, q scaled by dk^-0.5); scaling one operand lifts the products above it. Both scales are powers of two,
+  so the math is unchanged."""
+  return ((a * _BMM_SCALE) @ b) * (1.0 / _BMM_SCALE)
+
+
 def _deltanet_decode_stage_b(hmap, w, cfg, ls, ctx, M):
   """Gated-DeltaNet decode, state block: applies the DeltaNet recurrence to the resident
   state [nv, dk, dv] (decay, k@S delta rule, outer update). Boundary lanes in:
@@ -96,9 +107,9 @@ def _deltanet_decode_stage_b(hmap, w, cfg, ls, ctx, M):
   v = hmap["v"].reshape((nv, 1, dv))
   beta, gt, x, z = hmap["beta"], hmap["gt"], hmap["x"], hmap["z"]
   S1 = S * gt                                                    # decay first (transformers/qwen3.5)
-  kv = k @ S1; delta = (v - kv) * beta
-  Sout = S1 + (k.transpose([0, 2, 1]) @ delta)
-  o = (q @ Sout).reshape((nv, dv))
+  kv = _scaled_bmm(k, S1); delta = (v - kv) * beta
+  Sout = S1 + _scaled_bmm(k.transpose([0, 2, 1]), delta)
+  o = _scaled_bmm(q, Sout).reshape((nv, dv))
   return {"x": x, "o": o, "z": z}, [(Sout, S)]
 
 
