@@ -407,8 +407,21 @@ def _upsample_bilinear_block():
   return Case("upsample_bilinear_block", "nn", build, ref, [x], tol=0.02)
 
 
+def _silu_tanh_block():
+  x = np.concatenate([np.linspace(-12, 12, 1017), [0.0, 0.5, -0.5, 1.0, -1.0, 8.0, -8.0]]).astype(np.float16).reshape(1, 1, 1, 1024)
+
+  def build(xt):
+    return xt.silu_tanh()
+
+  def ref(xa):
+    return xa / (1 + np.exp(-xa))
+
+  return Case("silu_tanh", "nn", build, ref, [x], abserr=0.01)
+
+
 CASES = [
   _conv_stack(),
+  _silu_tanh_block(),
   _cnn_classifier(),
   _transformer_encoder(),
   _rms_norm_block(),

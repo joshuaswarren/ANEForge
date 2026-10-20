@@ -49,6 +49,13 @@ class Tensor:
   def relu(self) -> "Tensor": return Tensor(self.shape, "relu", [self])
   def gelu(self) -> "Tensor": return Tensor(self.shape, "gelu", [self])
   def silu(self) -> "Tensor": return Tensor(self.shape, "silu", [self])
+  def silu_tanh(self) -> "Tensor":
+    """`x * sigmoid(x)` computed as `h * (1 + tanh(h))` with `h = x / 2` (four ops: scalar multiply, tanh, scalar add, multiply). Measured on H13
+    (the 13-inch and the 16-inch give identical bits), over every fp16 value in [-16, 16]: the native ANE `silu` op has a maximum absolute error of
+    0.0149 at x = 0.4998 and an rms of 0.0030, this form 0.0036 and 0.00039. Other chip families are not measured. Each use costs 3 more ANE tasks
+    than `silu`."""
+    h = self * 0.5
+    return h * h.tanh().adds(1.0)
   def sigmoid(self) -> "Tensor": return Tensor(self.shape, "sigmoid", [self])
   def tanh(self) -> "Tensor": return Tensor(self.shape, "tanh", [self])
   def exp(self) -> "Tensor": return Tensor(self.shape, "exp", [self])
