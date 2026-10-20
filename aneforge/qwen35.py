@@ -84,9 +84,10 @@ def _deltanet_decode_stage_a(hmap, w, cfg, ls, ctx, M):
 # 2^8. Measured on Qwen3.8-2B (13-inch and 16-inch, KL against an fp32 evaluation, 10 prompts x 32 steps, 50 positions) with the
 # scale 2^k: k = 4 0.0489, k = 6 0.0395, k = 8 0.0394, k = 10 0.0392, k = 11 0.0865. The KL is flat from 2^6 to 2^10 and 2^8 sits
 # in the middle. The raw matmul output is 2^k x the product. The ANE matmul returns inf when a partial sum passes 2^15 = 32,768
-# (measured on a 128-term matmul, the same bits on H13 and H14). At 2^8 the largest measured raw output is 4,591 (largest
-# product 17.93 for k @ S1, 14.51 for k^T @ delta, 0.84 for the q @ S readout), a factor 7 below that limit; 2^11 x 17.93 =
-# 36.7k is above it. The largest |k| is 0.9985 (scaled 255.6). Other models or longer contexts need their own check.
+# (measured on a 128-term matmul, the same bits on H13 and H14). At 2^8 the largest measured final raw output is 4,591 (largest
+# product 17.93 for k @ S1, 14.51 for k^T @ delta, 0.84 for the q @ S readout), a factor 7 below 2^15; the partial sums were not
+# measured. 2^11 x 17.93 = 36.7k is above 2^15. The largest |k| is 0.9985 (scaled 255.6). Other models or longer contexts need
+# their own check.
 _BMM_SCALE = 256.0
 
 
