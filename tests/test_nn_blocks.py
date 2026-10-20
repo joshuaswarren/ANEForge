@@ -408,7 +408,7 @@ def _upsample_bilinear_block():
 
 
 def _silu_tanh_block():
-  x = np.concatenate([np.linspace(-12, 12, 1024), [0.0, 0.5, -0.5, 1.0, -1.0, 8.0, -8.0]]).astype(np.float16)[:1024].reshape(1, 1, 1, 1024)
+  x = np.concatenate([np.linspace(-12, 12, 1017), [0.0, 0.5, -0.5, 1.0, -1.0, 8.0, -8.0]]).astype(np.float16).reshape(1, 1, 1, 1024)
 
   def build(xt):
     return xt.silu_tanh()
