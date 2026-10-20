@@ -94,3 +94,10 @@ def test_deltanet_stage_a_conv_and_stage_c_gate_use_the_tanh_form():
   out, _ = _deltanet_decode_stage_c(hmap, w, CFG, None, {}, 1)
   ops_c = _ops([out["h"]])
   assert "silu" not in ops_c and ops_c.count("tanh") == 1
+
+
+def test_speculative_verifier_uses_the_same_activation_as_the_decode():
+  import inspect
+  from aneforge import speculative
+  src = inspect.getsource(speculative._verify_block)
+  assert ".silu_tanh()" in src and ".silu()" not in src
