@@ -66,7 +66,7 @@ def _deltanet_decode_stage_a(hmap, w, cfg, ls, ctx, M):
   z = xn.linear(w["in_proj_z"]).reshape((nv, dv))
   b = xn.linear(w["in_proj_b"]).reshape((1, nv)); a = xn.linear(w["in_proj_a"]).reshape((1, nv))
   win = _concat([cs, qkv], axis=1)                               # [CD, K]: oldest..newest
-  conv = (win * _const(w["conv1d"])).sum([1]).reshape((1, CD)).silu()
+  conv = (win * _const(w["conv1d"])).sum([1]).reshape((1, CD)).silu_tanh()
   cs_out = win.slice_by_size([0, 1], [CD, K - 1])                # drop the oldest -> new conv state
   q = conv.slice_by_size([0, 0], [1, kd]).reshape((nk, dk))
   k = conv.slice_by_size([0, kd], [1, kd]).reshape((nk, dk))
@@ -129,7 +129,7 @@ def _deltanet_decode_stage_c(hmap, w, cfg, ls, ctx, M):
   e = cfg.extra
   nk, nv, dk, dv, K = e["nk"], e["nv"], e["dk"], e["dv"], e["conv_k"]
   vd = nv * dv
-  o = o.rms_norm(w["ssm_norm"], cfg.norm_eps) * z.silu()         # RMSNormGated, then SwiGLU gate
+  o = o.rms_norm(w["ssm_norm"], cfg.norm_eps) * z.silu_tanh()   # RMSNormGated, then SwiGLU gate
   return {"h": x + o.reshape((1, vd)).linear(w["out_proj"])}, []
 
 
