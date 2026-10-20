@@ -81,6 +81,21 @@ def _deltanet_decode_stage_a(hmap, w, cfg, ls, ctx, M):
   return {"x": x, "q": q, "k": k, "v": v, "beta": beta, "gt": gt, "z": z}, [(cs_out, cs)]
 
 
+# 2^8. fp16 ceiling: the raw matmul output is 256 x the product, so |product| must stay below about 255 and the scaled left
+# operand below 65504. Measured on Qwen3.8-2B (fp32 evaluation, 10 prompts x 32 steps, 50 positions): the largest |product|
+# is 17.93 (k @ S1; k^T @ delta 14.51; the q @ S readout 0.84), i.e. a raw output of 4,591; the largest |k| is 0.9985
+# (scaled 255.6). Other models or longer contexts need their own check before relying on this margin.
+_BMM_SCALE = 256.0
+
+
+def _scaled_bmm(a, b):
+  """`a @ b` with the left operand scaled by 2^8 before the matmul and the result by 2^-8 after. The ANE matmul has an
+  absolute error floor in its raw output that is large next to the tiny products of the delta-rule state update
+  (unit-norm k, q scaled by dk^-0.5); scaling one operand lifts the products above it. Both scales are powers of two,
+  so the math is unchanged."""
+  return ((a * _BMM_SCALE) @ b) * (1.0 / _BMM_SCALE)
+
+
 def _deltanet_decode_stage_b(hmap, w, cfg, ls, ctx, M):
   """Gated-DeltaNet decode, state block: applies the DeltaNet recurrence to the resident
   state [nv, dk, dv] (decay, k@S delta rule, outer update). Boundary lanes in:
@@ -96,9 +111,9 @@ def _deltanet_decode_stage_b(hmap, w, cfg, ls, ctx, M):
   v = hmap["v"].reshape((nv, 1, dv))
   beta, gt, x, z = hmap["beta"], hmap["gt"], hmap["x"], hmap["z"]
   S1 = S * gt                                                    # decay first (transformers/qwen3.5)
-  kv = k @ S1; delta = (v - kv) * beta
-  Sout = S1 + (k.transpose([0, 2, 1]) @ delta)
-  o = (q @ Sout).reshape((nv, dv))
+  kv = _scaled_bmm(k, S1); delta = (v - kv) * beta
+  Sout = S1 + _scaled_bmm(k.transpose([0, 2, 1]), delta)
+  o = _scaled_bmm(q, Sout).reshape((nv, dv))
   return {"x": x, "o": o, "z": z}, [(Sout, S)]
 
 
