@@ -90,10 +90,10 @@ _BMM_SCALE = 256.0
 
 
 def _scaled_bmm(a, b):
-  """`a @ b` with the left operand scaled by 2^8 before the matmul and the result by 2^-8 after. The ANE matmul rounds each
-  product to a multiple of 2^-16 (measured, the same bits on H13 and H14), which is large next to the tiny products of the
-  delta-rule state update (unit-norm k, q scaled by dk^-0.5); scaling one operand lifts the products above the rounding step.
-  Both scales are powers of two, so the math is unchanged."""
+  """`a @ b` with the left operand scaled by 2^8 before the matmul and the result by 2^-8 after. For products far below 2^-12
+  the ANE matmul rounds each product to the nearest multiple of 2^-16 before it sums (measured, the same bits on H13 and
+  H14). That step is large next to the tiny products of the delta-rule state update (unit-norm k, q scaled by dk^-0.5);
+  scaling one operand lifts the products above it. Both scales are powers of two, so the math is unchanged."""
   return ((a * _BMM_SCALE) @ b) * (1.0 / _BMM_SCALE)
 
 
