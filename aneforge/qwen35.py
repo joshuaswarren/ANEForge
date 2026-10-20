@@ -81,7 +81,11 @@ def _deltanet_decode_stage_a(hmap, w, cfg, ls, ctx, M):
   return {"x": x, "q": q, "k": k, "v": v, "beta": beta, "gt": gt, "z": z}, [(cs_out, cs)]
 
 
-_BMM_SCALE = 256.0   # 2^8
+# 2^8. fp16 ceiling: the raw matmul output is 256 x the product, so |product| must stay below about 255 and the scaled left
+# operand below 65504. Measured on Qwen3.8-2B (fp32 evaluation, 10 prompts x 32 steps, 50 positions): the largest |product|
+# is 17.93 (k @ S1; k^T @ delta 14.51; the q @ S readout 0.84), i.e. a raw output of 4,591; the largest |k| is 0.9985
+# (scaled 255.6). Other models or longer contexts need their own check before relying on this margin.
+_BMM_SCALE = 256.0
 
 
 def _scaled_bmm(a, b):
