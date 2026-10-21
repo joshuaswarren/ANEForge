@@ -419,9 +419,22 @@ def _silu_tanh_block():
   return Case("silu_tanh", "nn", build, ref, [x], abserr=0.01)
 
 
+def _silu_expdiv_block():
+  x = np.concatenate([np.linspace(-12, 12, 1017), [0.0, 0.5, -0.5, 1.0, -1.0, 8.0, -8.0]]).astype(np.float16).reshape(1, 1, 1, 1024)
+
+  def build(xt):
+    return xt.silu_expdiv()
+
+  def ref(xa):
+    return xa / (1 + np.exp(-xa))
+
+  return Case("silu_expdiv", "nn", build, ref, [x], abserr=0.01)
+
+
 CASES = [
   _conv_stack(),
   _silu_tanh_block(),
+  _silu_expdiv_block(),
   _cnn_classifier(),
   _transformer_encoder(),
   _rms_norm_block(),
