@@ -66,7 +66,7 @@ def _deltanet_decode_stage_a(hmap, w, cfg, ls, ctx, M):
   z = xn.linear(w["in_proj_z"]).reshape((nv, dv))
   b = xn.linear(w["in_proj_b"]).reshape((1, nv)); a = xn.linear(w["in_proj_a"]).reshape((1, nv))
   win = _concat([cs, qkv], axis=1)                               # [CD, K]: oldest..newest
-  conv = (win * _const(w["conv1d"])).sum([1]).reshape((1, CD)).silu_tanh()
+  conv = (win * _const(w["conv1d"])).sum([1]).reshape((1, CD)).silu_expdiv()
   cs_out = win.slice_by_size([0, 1], [CD, K - 1])                # drop the oldest -> new conv state
   q = conv.slice_by_size([0, 0], [1, kd]).reshape((nk, dk))
   k = conv.slice_by_size([0, kd], [1, kd]).reshape((nk, dk))
@@ -88,7 +88,10 @@ def _deltanet_decode_stage_a(hmap, w, cfg, ls, ctx, M):
 # product. The ANE matmul returns inf when a partial sum passes 2^15 = 32,768 (measured on a 128-term matmul, the same bits on H13 and
 # H14). At 2^8 the largest measured final raw output is 5,133 over 50 prompts and 145 positions (largest product 20.05 for k @ S1,
 # every other matmul below 16), a factor 6.4 below 2^15; the partial sums were not measured. 2^11 x 20.05 = 41k is above 2^15. The
-# largest |k| is 0.9985 (scaled 255.6, 10 prompts x 32 steps). Other models need their own check.
+# largest |k| is 0.9985 (scaled 255.6, 10 prompts x 32 steps). Those KL figures use the native silu, which carries most of that KL. With the
+# tanh form of silu at every site the KL against fp32 is 0.513 unscaled, 0.00032 at 2^6, 0.00018 at 2^8 and 0.00021 at 2^10 (10 prompts x 32
+# steps, 50 positions). The decode that ships (expdiv silu at the conv and the FFN gate, native at the z gate, 2^8) has a KL of 0.000293 over
+# 50 prompts x 128 tokens at 192 positions (identical on the 13-inch and the 16-inch, 0.000295 on the M2 Max). Other models need their own check.
 _BMM_SCALE = 256.0
 
 
@@ -130,7 +133,7 @@ def _deltanet_decode_stage_c(hmap, w, cfg, ls, ctx, M):
   e = cfg.extra
   nk, nv, dk, dv, K = e["nk"], e["nv"], e["dk"], e["dv"], e["conv_k"]
   vd = nv * dv
-  o = o.rms_norm(w["ssm_norm"], cfg.norm_eps) * z.silu_tanh()   # RMSNormGated, then SwiGLU gate
+  o = o.rms_norm(w["ssm_norm"], cfg.norm_eps) * z.silu()   # RMSNormGated, then SwiGLU gate (native silu: tanh here is worth about 1e-4 nats of KL and costs step time)
   return {"h": x + o.reshape((1, vd)).linear(w["out_proj"])}, []
 
 
