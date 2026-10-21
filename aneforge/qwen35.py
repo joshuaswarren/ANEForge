@@ -133,7 +133,7 @@ def _deltanet_decode_stage_c(hmap, w, cfg, ls, ctx, M):
   e = cfg.extra
   nk, nv, dk, dv, K = e["nk"], e["nv"], e["dk"], e["dv"], e["conv_k"]
   vd = nv * dv
-  o = o.rms_norm(w["ssm_norm"], cfg.norm_eps) * z.silu()   # RMSNormGated, then SwiGLU gate (native silu: the z gate carries none of the error)
+  o = o.rms_norm(w["ssm_norm"], cfg.norm_eps) * z.silu()   # RMSNormGated, then SwiGLU gate (native silu: tanh here is worth about 1e-4 nats of KL and costs step time)
   return {"h": x + o.reshape((1, vd)).linear(w["out_proj"])}, []
 
 
