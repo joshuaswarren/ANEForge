@@ -38,7 +38,7 @@ def _verify_block(x, w, cfg, Kq, Kin, Vin, place, invc, mask, cosp, sinp):
   sc = ((q @ Kr.transpose([0, 2, 1])) * (1.0 / dh ** 0.5) + mask).softmax(-1)
   a = (sc @ Vr).transpose([1, 0, 2]).reshape((Kq, H * dh))
   h = x + a.linear(w["wo"]); hn = h.rms_norm(w["mlp_norm"], cfg.norm_eps)
-  return h + (hn.linear(w["wgate"]).silu_tanh() * hn.linear(w["wup"])).linear(w["wdown"]), Kout, Vout
+  return h + (hn.linear(w["wgate"]).silu_expdiv() * hn.linear(w["wup"])).linear(w["wdown"]), Kout, Vout
 
 
 def _build_verifier(m, M, Kq):

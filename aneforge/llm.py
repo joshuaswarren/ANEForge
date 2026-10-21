@@ -169,10 +169,10 @@ def _attn_prefill_kv(x: Tensor, w: dict, cfg: LlamaConfig, ls: LayerSpec, cos, s
 
 
 def _swiglu(h: Tensor, w: dict, cfg: LlamaConfig, ls: LayerSpec) -> Tensor:
-  """SwiGLU MLP with its residual: `h + down(silu(gate(norm(h))) * up(norm(h)))`, with silu in its tanh form (`Tensor.silu_tanh`).
+  """SwiGLU MLP with its residual: `h + down(silu(gate(norm(h))) * up(norm(h)))`, with silu in its expdiv form (`Tensor.silu_expdiv`).
   Stateless and shape-agnostic, so one builder serves both prefill [S,dim] and decode [1,dim]."""
   hn = h.rms_norm(w["mlp_norm"], cfg.norm_eps)
-  return h + (hn.linear(w["wgate"]).silu_tanh() * hn.linear(w["wup"])).linear(w["wdown"])
+  return h + (hn.linear(w["wgate"]).silu_expdiv() * hn.linear(w["wup"])).linear(w["wdown"])
 
 
 def _gelu_mlp(h: Tensor, w: dict, cfg: LlamaConfig, ls: LayerSpec) -> Tensor:
