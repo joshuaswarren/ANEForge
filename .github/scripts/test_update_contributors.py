@@ -179,7 +179,6 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual((rc, changed), (0, True))
         self.assertIn("alice", text)
         self.assertIn("bob", text)
-        import contextlib, io
         os.remove(target)
 
 
@@ -442,18 +441,6 @@ class MalformedLinkTests(unittest.TestCase):
     def test_malformed_next_segment_returns_none(self):
         self.assertIsNone(uc._next_link('<https://x?page=2; rel="next"'))
         self.assertIsNone(uc._next_link('https://x?page=2> ; rel="next"'))
-
-
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 
 
 

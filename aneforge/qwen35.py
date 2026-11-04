@@ -110,7 +110,7 @@ def _deltanet_decode_stage_b(hmap, w, cfg, ls, ctx, M):
   slice-view of a packed hidden ever feeds the batched matmuls (the 804234f
   KNOWN-REMAINING: slice-fed operands blew the whole-program ceiling)."""
   e = cfg.extra
-  nk, nv, dk, dv, K = e["nk"], e["nv"], e["dk"], e["dv"], e["conv_k"]
+  nv, dk, dv = e["nv"], e["dk"], e["dv"]
   S = _input((nv, dk, dv))
   q = hmap["q"].reshape((nv, 1, dk)); k = hmap["k"].reshape((nv, 1, dk))
   v = hmap["v"].reshape((nv, 1, dv))
@@ -128,7 +128,7 @@ def _deltanet_decode_stage_c(hmap, w, cfg, ls, ctx, M):
   single new residual stream."""
   x, o, z = hmap["x"], hmap["o"], hmap["z"]
   e = cfg.extra
-  nk, nv, dk, dv, K = e["nk"], e["nv"], e["dk"], e["dv"], e["conv_k"]
+  nv, dv = e["nv"], e["dv"]
   vd = nv * dv
   o = o.rms_norm(w["ssm_norm"], cfg.norm_eps) * z.silu_tanh()   # RMSNormGated, then SwiGLU gate
   return {"h": x + o.reshape((1, vd)).linear(w["out_proj"])}, []

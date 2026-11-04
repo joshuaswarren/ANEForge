@@ -10,6 +10,7 @@ import warnings
 from dataclasses import dataclass, field
 from enum import Enum
 import time
+from typing import Any
 import numpy as np
 
 from .graph import Tensor, input as _input, concat as _concat, _const
@@ -462,7 +463,7 @@ class LlamaPrefill:
       inm = {id(t): n for t, n in net.input_ports}; om = dict(net.output_ports)
       for o, i in pairs:                                        # alias each state output -> its input (resident)
         net.prog.share_buffer(0, om[o], 0, inm[id(i)])
-      p = {"x": {name: inm[id(t)] for name, t in hmap_in.items() if id(t) in inm},
+      p: dict[str, Any] = {"x": {name: inm[id(t)] for name, t in hmap_in.items() if id(t) in inm},
            "h": {name: om[t] for name, t in fresh.items()},
            "states": {inm[id(i)]: i.shape for _, i in pairs}}
       if group_start: p["group_start"] = True
@@ -475,6 +476,7 @@ class LlamaPrefill:
       ctx = {"oh": _input((1, M, 1)), "inv": _input((1, M, 1)), "mask": _input((1, 1, M)),
              "cosp": _input((1, dh)), "sinp": _input((1, dh))}
       hmap = {"x": _input((1, D))}
+      h = hmap["x"]                              # pass-through default for an (impossible) empty group
       seg_in = hmap                              # lanes this PROGRAM consumed (fed by the host)
       pairs = []
       wpe_pos = None
@@ -486,6 +488,7 @@ class LlamaPrefill:
         ls = self._spec(li); lw = self.w["layers"][li]
         stages = DECODE_MIXER_STAGES.get(ls.mixer)
         if stages:
+          hb: dict = {}
           for si, fn in enumerate(stages):
             hb, sp = fn(hmap, lw, cfg, ls, ctx, M)
             pairs += sp
