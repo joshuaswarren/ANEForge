@@ -140,6 +140,15 @@ def _vjp_adds(t, g):
   return [g]
 
 
+@vjp("real_div")
+def _vjp_real_div(t, g):
+  a, b = t.srcs                                    # t = a / b
+  if t.attrs.get("silu_of"):                       # Tensor.silu_expdiv: silu'(x), no gradient through the exp (it overflows fp16 below x = -11.09)
+    return _vjp_silu(t, g) + [None]
+  q = g / b
+  return [_unbroadcast(q, a.shape), _unbroadcast(q * t * -1.0, b.shape)]   # g/b and -g*a/b^2 = -(g/b)*t
+
+
 @vjp("square")
 def _vjp_square(t, g):
   x = t.srcs[0]

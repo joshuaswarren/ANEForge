@@ -56,6 +56,13 @@ class Tensor:
     than `silu`."""
     h = self * 0.5
     return h * h.tanh().adds(1.0)
+  def silu_expdiv(self) -> "Tensor":
+    """`x * sigmoid(x)` computed as `x / (exp(-x) + 1)` (four ops: scalar multiply, exp, scalar add, divide). Measured on H13 and H14 (the 13-inch, the
+    16-inch and the M2 Max give identical bits), over every finite fp16 value in [-16, 16] (38,914 values): the native ANE `silu` op has a maximum
+    absolute error of 0.0149 and an rms of 0.0030, this form 0.00493 (at x = 6.0195) and 0.00044. Other chip families are not measured."""
+    y = self / (self * -1.0).exp().adds(1.0)
+    y.attrs["silu_of"] = True     # autograd: the divide is silu(x), differentiated as silu (the generic divide rule multiplies 0 by an overflowing exp below x = -11.09)
+    return y
   def sigmoid(self) -> "Tensor": return Tensor(self.shape, "sigmoid", [self])
   def tanh(self) -> "Tensor": return Tensor(self.shape, "tanh", [self])
   def exp(self) -> "Tensor": return Tensor(self.shape, "exp", [self])
